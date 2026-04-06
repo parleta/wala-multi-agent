@@ -1,0 +1,18 @@
+services:
+  agents:
+    build: ./agents
+    container_name: wala-agents
+    env_file: ./agents/.env
+    volumes:
+      - ./agents/credentials.json:/app/credentials.json
+      - ./agents/token.json:/app/token.json
+    ports:
+      - "8000:8000"
+
+  whatsapp_bot:
+    build: ./whatsapp_bot
+    container_name: wala-bot
+    depends_on:
+      - agents
+    volumes:
+      - ./whatsapp_bot/auth_info:/app/auth_info

@@ -1,0 +1,11 @@
+# OS
+.DS_Store
+
+# Secrets
+agents/.env
+agents/credentials.json
+agents/token.json
+whatsapp_bot/auth_info/
+
+# Dependencies
+whatsapp_bot/node_modules/
