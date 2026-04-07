@@ -48,7 +48,7 @@ async function startBot() {
             console.log(`[AGENT] Processing: ${text}`);
             
             try {
-                const response = await axios.post('http://agents:8000/chat', {
+                const response = await axios.post('http://orchestrator:8000/chat', {
                     text: text,
                     sender: sender
                 });

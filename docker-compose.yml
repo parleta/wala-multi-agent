@@ -1,18 +1,34 @@
 services:
-  agents:
+  orchestrator:
     build: ./agents
-    container_name: wala-agents
+    container_name: wala-orchestrator
     env_file: ./agents/.env
+    command: ["python", "orchestrator_server.py"]
+    depends_on:
+      - calendar_agent
+      - maps_agent
+    ports:
+      - "8000:8000"
+
+  calendar_agent:
+    build: ./agents
+    container_name: wala-calendar-agent
+    env_file: ./agents/.env
+    command: ["python", "calendar_agent_server.py"]
     volumes:
       - ./agents/credentials.json:/app/credentials.json
       - ./agents/token.json:/app/token.json
-    ports:
-      - "8000:8000"
+
+  maps_agent:
+    build: ./agents
+    container_name: wala-maps-agent
+    env_file: ./agents/.env
+    command: ["python", "maps_agent_server.py"]
 
   whatsapp_bot:
     build: ./whatsapp_bot
     container_name: wala-bot
     depends_on:
-      - agents
+      - orchestrator
     volumes:
       - ./whatsapp_bot/auth_info:/app/auth_info

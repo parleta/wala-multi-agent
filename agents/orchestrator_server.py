@@ -1,0 +1,101 @@
+import os
+from typing import Literal
+
+import httpx
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from langchain_core.messages import SystemMessage
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+
+from message_protocol import WireMessage, last_ai_text, wire_to_lc
+
+load_dotenv()
+
+app = FastAPI()
+
+BASE_DIR = os.path.dirname(__file__)
+with open(os.path.join(BASE_DIR, "prompts", "supervisor.md"), "r", encoding="utf-8") as f:
+    SUPERVISOR_PROMPT = f.read()
+
+CALENDAR_AGENT_URL = os.getenv("CALENDAR_AGENT_URL", "http://calendar_agent:8000/run")
+MAPS_AGENT_URL = os.getenv("MAPS_AGENT_URL", "http://maps_agent:8000/run")
+
+
+class ChatRequest(BaseModel):
+    text: str
+    sender: str
+
+
+class Router(BaseModel):
+    next_agent: Literal["calendar_agent", "maps_agent", "FINISH"] = Field(
+        description="Transfer or FINISH."
+    )
+
+
+sessions: dict[str, list[WireMessage]] = {}
+
+
+async def call_agent(url: str, messages: list[WireMessage]) -> list[WireMessage]:
+    payload = {"messages": [m.model_dump() for m in messages]}
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(url, json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+    return [WireMessage(**item) for item in data["messages"]]
+
+
+def should_force_finish_from_last_message(messages: list[WireMessage]) -> bool:
+    if not messages:
+        return False
+
+    last = messages[-1]
+    if last.role != "ai":
+        return False
+
+    content = last.content.lower()
+    return "passing to" not in content and "handing over" not in content
+
+
+def pick_last_reply(messages: list[WireMessage]) -> str:
+    lc_messages = wire_to_lc(messages)
+    return last_ai_text(lc_messages)
+
+
+@app.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+    history = sessions.get(request.sender, []).copy()
+    history.append(WireMessage(role="human", content=request.text))
+
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    structured_llm = llm.with_structured_output(Router)
+
+    for _ in range(8):
+        lc_messages = wire_to_lc(history)
+        router_response = structured_llm.invoke([SystemMessage(content=SUPERVISOR_PROMPT)] + lc_messages)
+        next_step = router_response.next_agent
+
+        if should_force_finish_from_last_message(history):
+            next_step = "FINISH"
+
+        if next_step == "FINISH":
+            reply = pick_last_reply(history)
+            sessions[request.sender] = history
+            return {"reply": reply}
+
+        target_url = CALENDAR_AGENT_URL if next_step == "calendar_agent" else MAPS_AGENT_URL
+
+        try:
+            history = await call_agent(target_url, history)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Agent call failed: {exc}") from exc
+
+    reply = pick_last_reply(history)
+    sessions[request.sender] = history
+    return {"reply": reply}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
