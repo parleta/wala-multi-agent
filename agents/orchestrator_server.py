@@ -5,20 +5,32 @@ from typing import Literal
 import requests
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from langchain_core.messages import SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from aztm_bootstrap import login_aztm_from_env
+from flow_log import (
+    flow_log,
+    install_aztm_print_filter,
+    outbound_transport_for_url,
+    request_correlation_id,
+    request_sender,
+    request_transport,
+    service_from_url,
+)
 from message_protocol import WireMessage, last_ai_text, wire_to_lc
 
 load_dotenv()
 
 app = FastAPI()
 
+# Keep AZTM hook debug noise out of runtime logs.
+install_aztm_print_filter()
+
 # Initialize AZTM after FastAPI app is created so auto-hook can detect the app.
-login_aztm_from_env(server_mode=True)
+login_aztm_from_env(server_mode=False)
 
 BASE_DIR = os.path.dirname(__file__)
 with open(os.path.join(BASE_DIR, "prompts", "supervisor.md"), "r", encoding="utf-8") as f:
@@ -47,10 +59,6 @@ class Router(BaseModel):
 
 
 sessions: dict[str, list[WireMessage]] = {}
-
-
-def _debug(msg: str) -> None:
-    print(f"[ORCH] {msg}", flush=True)
 
 
 def _short(text: str, max_len: int = 180) -> str:
@@ -105,20 +113,33 @@ def _generate_direct_reply(messages: list[WireMessage]) -> str:
     return "I understand. Can you share a bit more so I can help accurately?"
 
 
-async def call_agent(url: str, agent_name: str, messages: list[WireMessage]) -> list[WireMessage]:
+async def call_agent(url: str, messages: list[WireMessage], corr: str) -> list[WireMessage]:
     payload = {"messages": [m.model_dump() for m in messages]}
-    _debug(
-        f"-> {agent_name} url={url} "
-        f"last_human='{_short(_last_role_text(messages, 'human'))}' "
-        f"history_len={len(messages)}"
+    destination = service_from_url(url)
+    transport = outbound_transport_for_url(url)
+
+    flow_log(
+        sender="orchestrator",
+        destination=destination,
+        transport=transport,
+        path="/run",
+        phase="dispatch",
+        corr=corr,
+        extra=f"history_len={len(messages)}",
     )
+
     data = await asyncio.to_thread(_post_json, url, payload, 120.0)
 
     new_messages = [WireMessage(**item) for item in data["messages"]]
-    _debug(
-        f"<- {agent_name} "
-        f"last_ai='{_short(_last_role_text(new_messages, 'ai'))}' "
-        f"history_len={len(new_messages)}"
+    flow_log(
+        sender=destination,
+        destination="orchestrator",
+        transport=transport,
+        path="/run",
+        phase="response",
+        corr=corr,
+        status="ok",
+        extra=f"last_ai='{_short(_last_role_text(new_messages, 'ai'))}'",
     )
     return new_messages
 
@@ -141,8 +162,20 @@ def pick_last_reply(messages: list[WireMessage]) -> str:
 
 
 @app.post("/chat")
-async def chat_endpoint(request: ChatRequest):
-    _debug(f"<- bot sender={request.sender} text='{_short(request.text)}'")
+async def chat_endpoint(request: ChatRequest, http_request: Request):
+    inbound_transport = request_transport(http_request)
+    inbound_sender = request_sender(http_request, request.sender)
+    corr = request_correlation_id(http_request)
+
+    flow_log(
+        sender=inbound_sender,
+        destination="orchestrator",
+        transport=inbound_transport,
+        path="/chat",
+        phase="inbound",
+        corr=corr,
+    )
+
     history = sessions.get(request.sender, []).copy()
     history.append(WireMessage(role="human", content=request.text))
 
@@ -153,11 +186,9 @@ async def chat_endpoint(request: ChatRequest):
         lc_messages = wire_to_lc(history)
         router_response = structured_llm.invoke([SystemMessage(content=SUPERVISOR_PROMPT)] + lc_messages)
         next_step = router_response.next_agent
-        _debug(f"router next_agent={next_step}")
 
         if should_force_finish_from_last_message(history):
             next_step = "FINISH"
-            _debug("forcing FINISH due to final AI response in history")
 
         if next_step == "FINISH":
             if history and history[-1].role == "ai":
@@ -165,23 +196,48 @@ async def chat_endpoint(request: ChatRequest):
             else:
                 reply = _generate_direct_reply(history)
                 history.append(WireMessage(role="ai", content=reply))
-                _debug("generated fresh FINISH reply for latest human turn")
 
             sessions[request.sender] = history
-            _debug(f"-> bot reply='{_short(reply)}'")
+            flow_log(
+                sender="orchestrator",
+                destination=inbound_sender,
+                transport=inbound_transport,
+                path="/chat",
+                phase="reply",
+                corr=corr,
+                status="ok",
+            )
             return {"reply": reply}
 
         target_url = CALENDAR_AGENT_URL if next_step == "calendar_agent" else MAPS_AGENT_URL
 
         try:
-            history = await call_agent(target_url, next_step, history)
+            history = await call_agent(target_url, history, corr)
         except requests.RequestException as exc:
-            _debug(f"agent call failed next_agent={next_step} error={exc}")
+            flow_log(
+                sender="orchestrator",
+                destination=service_from_url(target_url),
+                transport=outbound_transport_for_url(target_url),
+                path="/run",
+                phase="response",
+                corr=corr,
+                status="error",
+                extra=f"error='{_short(str(exc))}'",
+            )
             raise HTTPException(status_code=502, detail=f"Agent call failed: {exc}") from exc
 
     reply = pick_last_reply(history)
     sessions[request.sender] = history
-    _debug(f"-> bot reply(max-iterations)='{_short(reply)}'")
+    flow_log(
+        sender="orchestrator",
+        destination=inbound_sender,
+        transport=inbound_transport,
+        path="/chat",
+        phase="reply",
+        corr=corr,
+        status="ok",
+        extra="max_iterations=true",
+    )
     return {"reply": reply}
 
 

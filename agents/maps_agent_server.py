@@ -2,16 +2,20 @@ import os
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from langchain_google_community import GooglePlacesTool
 
 from agent_service_common import run_agent_until_response
 from aztm_bootstrap import login_aztm_from_env
-from message_protocol import AgentRunRequest, AgentRunResponse, WireMessage, last_ai_text, lc_to_wire, wire_to_lc
+from flow_log import flow_log, install_aztm_print_filter, request_correlation_id, request_sender, request_transport
+from message_protocol import AgentRunRequest, AgentRunResponse, last_ai_text, lc_to_wire, wire_to_lc
 
 load_dotenv()
 
 app = FastAPI()
+
+# Keep AZTM hook debug noise out of runtime logs.
+install_aztm_print_filter()
 
 # Initialize AZTM after FastAPI app is created so auto-hook can detect the app.
 login_aztm_from_env(server_mode=True)
@@ -23,30 +27,36 @@ with open(os.path.join(BASE_DIR, "prompts", "maps.md"), "r", encoding="utf-8") a
 maps_tools = [GooglePlacesTool()]
 
 
-def _short(text: str, max_len: int = 180) -> str:
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 3] + "..."
-
-
-def _last_human_text(messages: list[WireMessage]) -> str:
-    for msg in reversed(messages):
-        if msg.role == "human":
-            return msg.content
-    return ""
-
-
 @app.post("/run", response_model=AgentRunResponse)
-async def run_maps_agent(request: AgentRunRequest):
-    print(
-        f"[MAPS] <- orchestrator messages={len(request.messages)} "
-        f"last_human='{_short(_last_human_text(request.messages))}'",
-        flush=True,
+async def run_maps_agent(request: AgentRunRequest, http_request: Request):
+    transport = request_transport(http_request)
+    sender = request_sender(http_request, "orchestrator")
+    corr = request_correlation_id(http_request)
+
+    flow_log(
+        sender=sender,
+        destination="maps_agent",
+        transport=transport,
+        path="/run",
+        phase="inbound",
+        corr=corr,
+        extra=f"messages={len(request.messages)}",
     )
+
     messages = wire_to_lc(request.messages)
     updated_messages = run_agent_until_response(messages, MAPS_PROMPT, maps_tools)
     reply = last_ai_text(updated_messages)
-    print(f"[MAPS] -> orchestrator reply='{_short(reply)}'", flush=True)
+
+    flow_log(
+        sender="maps_agent",
+        destination=sender,
+        transport=transport,
+        path="/run",
+        phase="reply",
+        corr=corr,
+        status="ok",
+    )
+
     return AgentRunResponse(messages=lc_to_wire(updated_messages), reply=reply)
 
 

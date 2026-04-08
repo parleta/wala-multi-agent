@@ -12,10 +12,15 @@ const bridgePollIntervalMs = Number(process.env.BRIDGE_POLL_INTERVAL_MS || '1500
 const bridgePollTimeoutMs = Number(process.env.BRIDGE_POLL_TIMEOUT_MS || '90000');
 const processingReaction = process.env.BRIDGE_PROCESSING_REACTION || '👍';
 
-function shortText(text, maxLen = 180) {
-    if (!text) return '';
-    if (text.length <= maxLen) return text;
-    return text.slice(0, maxLen - 3) + '...';
+function logFlow({ sender, destination, transport }) {
+    const parts = [
+        '[FLOW]',
+        `sender=${sender}`,
+        `destination=${destination}`,
+        `transport=${transport}`,
+    ];
+
+    console.log(parts.join(' '));
 }
 
 function sleep(ms) {
@@ -23,7 +28,12 @@ function sleep(ms) {
 }
 
 async function enqueueBridge(text, sender) {
-    console.log(`[BOT] -> bridge(queue): ${shortText(text)}`);
+    logFlow({
+        sender: 'whatsapp_bot',
+        destination: 'bot_bridge',
+        transport: 'http',
+    });
+
     const response = await axios.post(
         botBridgeUrl,
         { text, sender },
@@ -35,7 +45,6 @@ async function enqueueBridge(text, sender) {
         throw new Error('Bridge did not return request_id');
     }
 
-    console.log(`[BOT] <- bridge queued request_id=${requestId}`);
     return requestId;
 }
 
@@ -50,6 +59,11 @@ async function waitForBridgeReply(requestId) {
             const status = response?.data?.status;
 
             if (status === 'done') {
+                logFlow({
+                    sender: 'bot_bridge',
+                    destination: 'whatsapp_bot',
+                    transport: 'http',
+                });
                 return response?.data?.reply || '';
             }
 
@@ -57,14 +71,10 @@ async function waitForBridgeReply(requestId) {
                 throw new Error(response?.data?.error || 'Bridge processing failed');
             }
 
-            console.log(`[BOT] poll request_id=${requestId} status=${status || 'unknown'}`);
         } catch (error) {
             if (error.response?.status === 404) {
                 throw new Error(`Bridge request_id not found: ${requestId}`);
             }
-
-            // Transient polling errors should not instantly fail the user flow.
-            console.log(`[BOT] poll transient error request_id=${requestId}: ${error.message}`);
         }
 
         await sleep(bridgePollIntervalMs);
@@ -74,23 +84,21 @@ async function waitForBridgeReply(requestId) {
 }
 
 async function processIncomingText(sock, sender, text, key) {
-    console.log(`[AGENT] Processing: ${text}`);
-
     try {
         const requestId = await enqueueBridge(text, sender);
 
         try {
             await sock.sendMessage(sender, { react: { text: processingReaction, key } });
-            console.log(`[BOT] -> WhatsApp reaction sent request_id=${requestId}`);
-        } catch (reactionError) {
-            console.log(`[BOT] reaction failed request_id=${requestId}: ${reactionError.message}`);
-        }
+        } catch (reactionError) {}
 
         const reply = await waitForBridgeReply(requestId);
-        console.log(`[BOT] <- bridge final reply: ${shortText(reply)}`);
 
         await sock.sendMessage(sender, { text: reply || 'I finished processing but got an empty response.' });
-        console.log('[BOT] -> WhatsApp final message sent');
+        logFlow({
+            sender: 'whatsapp_bot',
+            destination: sender,
+            transport: 'whatsapp',
+        });
     } catch (error) {
         console.error('❌ Agent Error:', error.message);
         await sock.sendMessage(sender, {
@@ -121,21 +129,23 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // --- MESSAGE PROCESSING (SINGLE CHAT ONLY) ---
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
         if (!msg?.message || msg.key.remoteJid === 'status@broadcast') return;
         if (msg.key.fromMe) return;
 
         const sender = msg.key.remoteJid;
-        console.log(`[DEBUG] Message from: ${sender}`);
+        logFlow({
+            sender,
+            destination: 'whatsapp_bot',
+            transport: 'whatsapp',
+        });
 
         if (sender !== targetChatId) return;
 
         const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
         if (!text) return;
 
-        // Run per-message flow asynchronously so incoming events remain responsive.
         processIncomingText(sock, sender, text, msg.key).catch((error) => {
             console.error('❌ Unexpected message processing error:', error.message);
         });

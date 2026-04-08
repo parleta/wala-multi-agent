@@ -7,10 +7,18 @@ from typing import Any
 import requests
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from aztm_bootstrap import login_aztm_from_env
+from flow_log import (
+    flow_log,
+    install_aztm_print_filter,
+    outbound_transport_for_url,
+    request_sender,
+    request_transport,
+    service_from_url,
+)
 
 load_dotenv()
 
@@ -30,6 +38,9 @@ class ChatRequest(BaseModel):
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = asyncio.Lock()
 
+
+# Keep AZTM hook debug noise out of runtime logs.
+install_aztm_print_filter()
 
 # Initialize AZTM after FastAPI app is created so auto-hook can detect the app.
 login_aztm_from_env(server_mode=False)
@@ -70,7 +81,17 @@ async def _update_job(request_id: str, **fields: Any) -> None:
 
 async def _process_job(request_id: str, payload: dict) -> None:
     await _update_job(request_id, status="processing")
-    print(f"[BRIDGE] job={request_id} status=processing -> orchestrator", flush=True)
+
+    destination = service_from_url(ORCHESTRATOR_URL)
+    transport = outbound_transport_for_url(ORCHESTRATOR_URL)
+    flow_log(
+        sender="bot_bridge",
+        destination=destination,
+        transport=transport,
+        path="/chat",
+        phase="dispatch",
+        request_id=request_id,
+    )
 
     try:
         data = await asyncio.to_thread(
@@ -82,30 +103,60 @@ async def _process_job(request_id: str, payload: dict) -> None:
 
         reply = str(data.get("reply", "")).strip()
         await _update_job(request_id, status="done", reply=reply)
-        print(
-            f"[BRIDGE] job={request_id} status=done reply='{_short(reply)}'",
-            flush=True,
+        flow_log(
+            sender=destination,
+            destination="bot_bridge",
+            transport=transport,
+            path="/chat",
+            phase="response",
+            request_id=request_id,
+            status="done",
+            extra=f"reply='{_short(reply)}'",
         )
     except requests.RequestException as exc:
         error_text = f"Orchestrator call failed: {exc}"
         await _update_job(request_id, status="error", error=error_text)
-        print(f"[BRIDGE] job={request_id} status=error error='{_short(error_text)}'", flush=True)
+        flow_log(
+            sender=destination,
+            destination="bot_bridge",
+            transport=transport,
+            path="/chat",
+            phase="response",
+            request_id=request_id,
+            status="error",
+            extra=f"error='{_short(error_text)}'",
+        )
     except Exception as exc:  # noqa: BLE001
         error_text = f"Unexpected bridge error: {exc}"
         await _update_job(request_id, status="error", error=error_text)
-        print(f"[BRIDGE] job={request_id} status=error error='{_short(error_text)}'", flush=True)
+        flow_log(
+            sender=destination,
+            destination="bot_bridge",
+            transport=transport,
+            path="/chat",
+            phase="response",
+            request_id=request_id,
+            status="error",
+            extra=f"error='{_short(error_text)}'",
+        )
 
 
 @app.post("/chat")
-async def enqueue_chat(request: ChatRequest):
+async def enqueue_chat(request: ChatRequest, http_request: Request):
     await _cleanup_jobs()
 
     request_id = str(uuid.uuid4())
     payload = request.model_dump()
 
-    print(
-        f"[BRIDGE] <- bot sender={request.sender} text='{_short(request.text)}' request_id={request_id}",
-        flush=True,
+    inbound_sender = request_sender(http_request, request.sender)
+    inbound_transport = request_transport(http_request)
+    flow_log(
+        sender=inbound_sender,
+        destination="bot_bridge",
+        transport=inbound_transport,
+        path="/chat",
+        phase="inbound",
+        request_id=request_id,
     )
 
     async with JOBS_LOCK:
@@ -121,7 +172,15 @@ async def enqueue_chat(request: ChatRequest):
 
     asyncio.create_task(_process_job(request_id, payload))
 
-    print(f"[BRIDGE] -> bot queued request_id={request_id}", flush=True)
+    flow_log(
+        sender="bot_bridge",
+        destination=inbound_sender,
+        transport=inbound_transport,
+        path="/chat",
+        phase="queued",
+        request_id=request_id,
+        status="queued",
+    )
     return {
         "request_id": request_id,
         "status": "queued",
