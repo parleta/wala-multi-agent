@@ -1,5 +1,8 @@
 import asyncio
 import os
+import time
+import uuid
+from typing import Any
 
 import requests
 import uvicorn
@@ -14,11 +17,18 @@ load_dotenv()
 app = FastAPI()
 
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://orchestrator:8000/chat")
+ORCHESTRATOR_TIMEOUT_SEC = float(os.getenv("ORCHESTRATOR_TIMEOUT_SEC", "120"))
+RESULT_TTL_SEC = int(os.getenv("BRIDGE_RESULT_TTL_SEC", "900"))
 
 
 class ChatRequest(BaseModel):
     text: str
     sender: str
+
+
+# request_id -> job state
+JOBS: dict[str, dict[str, Any]] = {}
+JOBS_LOCK = asyncio.Lock()
 
 
 # Initialize AZTM after FastAPI app is created so auto-hook can detect the app.
@@ -37,26 +47,116 @@ def _post_json(url: str, payload: dict, timeout: float) -> dict:
     return response.json()
 
 
-@app.post("/chat")
-async def chat_proxy(request: ChatRequest):
-    print(
-        f"[BRIDGE] <- bot sender={request.sender} text='{_short(request.text)}'",
-        flush=True,
-    )
-    payload = request.model_dump()
+def _now() -> float:
+    return time.time()
+
+
+async def _cleanup_jobs() -> None:
+    cutoff = _now() - RESULT_TTL_SEC
+    async with JOBS_LOCK:
+        stale_ids = [request_id for request_id, job in JOBS.items() if job["updated_at"] < cutoff]
+        for request_id in stale_ids:
+            JOBS.pop(request_id, None)
+
+
+async def _update_job(request_id: str, **fields: Any) -> None:
+    async with JOBS_LOCK:
+        job = JOBS.get(request_id)
+        if job is None:
+            return
+        job.update(fields)
+        job["updated_at"] = _now()
+
+
+async def _process_job(request_id: str, payload: dict) -> None:
+    await _update_job(request_id, status="processing")
+    print(f"[BRIDGE] job={request_id} status=processing -> orchestrator", flush=True)
 
     try:
-        print(f"[BRIDGE] -> orchestrator url={ORCHESTRATOR_URL}", flush=True)
-        data = await asyncio.to_thread(_post_json, ORCHESTRATOR_URL, payload, 120.0)
+        data = await asyncio.to_thread(
+            _post_json,
+            ORCHESTRATOR_URL,
+            payload,
+            ORCHESTRATOR_TIMEOUT_SEC,
+        )
+
+        reply = str(data.get("reply", "")).strip()
+        await _update_job(request_id, status="done", reply=reply)
         print(
-            f"[BRIDGE] <- orchestrator reply='{_short(str(data.get('reply', '')))}'",
+            f"[BRIDGE] job={request_id} status=done reply='{_short(reply)}'",
             flush=True,
         )
-        print("[BRIDGE] -> bot reply forwarded", flush=True)
-        return data
     except requests.RequestException as exc:
-        print(f"[BRIDGE] orchestrator call failed: {exc}", flush=True)
-        raise HTTPException(status_code=502, detail=f"Orchestrator call failed: {exc}") from exc
+        error_text = f"Orchestrator call failed: {exc}"
+        await _update_job(request_id, status="error", error=error_text)
+        print(f"[BRIDGE] job={request_id} status=error error='{_short(error_text)}'", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        error_text = f"Unexpected bridge error: {exc}"
+        await _update_job(request_id, status="error", error=error_text)
+        print(f"[BRIDGE] job={request_id} status=error error='{_short(error_text)}'", flush=True)
+
+
+@app.post("/chat")
+async def enqueue_chat(request: ChatRequest):
+    await _cleanup_jobs()
+
+    request_id = str(uuid.uuid4())
+    payload = request.model_dump()
+
+    print(
+        f"[BRIDGE] <- bot sender={request.sender} text='{_short(request.text)}' request_id={request_id}",
+        flush=True,
+    )
+
+    async with JOBS_LOCK:
+        JOBS[request_id] = {
+            "status": "queued",
+            "sender": request.sender,
+            "text": request.text,
+            "reply": None,
+            "error": None,
+            "created_at": _now(),
+            "updated_at": _now(),
+        }
+
+    asyncio.create_task(_process_job(request_id, payload))
+
+    print(f"[BRIDGE] -> bot queued request_id={request_id}", flush=True)
+    return {
+        "request_id": request_id,
+        "status": "queued",
+    }
+
+
+@app.get("/chat/result/{request_id}")
+async def get_chat_result(request_id: str):
+    await _cleanup_jobs()
+
+    async with JOBS_LOCK:
+        job = JOBS.get(request_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Unknown request_id: {request_id}")
+
+    status = job["status"]
+    if status == "done":
+        return {
+            "request_id": request_id,
+            "status": "done",
+            "reply": job.get("reply") or "",
+        }
+
+    if status == "error":
+        return {
+            "request_id": request_id,
+            "status": "error",
+            "error": job.get("error") or "Unknown error",
+        }
+
+    return {
+        "request_id": request_id,
+        "status": status,
+    }
 
 
 if __name__ == "__main__":

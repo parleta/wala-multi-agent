@@ -24,6 +24,13 @@ BASE_DIR = os.path.dirname(__file__)
 with open(os.path.join(BASE_DIR, "prompts", "supervisor.md"), "r", encoding="utf-8") as f:
     SUPERVISOR_PROMPT = f.read()
 
+DIRECT_REPLY_PROMPT = (
+    "You are the WALA supervisor agent. "
+    "Answer the latest user message directly when no specialist transfer is needed. "
+    "Always answer the latest user message and never repeat stale previous answers. "
+    "Be concise, helpful, and context-aware."
+)
+
 CALENDAR_AGENT_URL = os.getenv("CALENDAR_AGENT_URL", "http://calendar_agent:8000/run")
 MAPS_AGENT_URL = os.getenv("MAPS_AGENT_URL", "http://maps_agent:8000/run")
 
@@ -63,6 +70,39 @@ def _post_json(url: str, payload: dict, timeout: float) -> dict:
     response = requests.post(url, json=payload, timeout=timeout)
     response.raise_for_status()
     return response.json()
+
+
+def _content_to_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+            elif item is not None:
+                parts.append(str(item))
+        return " ".join(parts).strip()
+
+    if content is None:
+        return ""
+
+    return str(content)
+
+
+def _generate_direct_reply(messages: list[WireMessage]) -> str:
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    lc_messages = wire_to_lc(messages)
+    ai_response = llm.invoke([SystemMessage(content=DIRECT_REPLY_PROMPT)] + lc_messages)
+
+    text = _content_to_text(getattr(ai_response, "content", "")).strip()
+    if text:
+        return text
+
+    return "I understand. Can you share a bit more so I can help accurately?"
 
 
 async def call_agent(url: str, agent_name: str, messages: list[WireMessage]) -> list[WireMessage]:
@@ -120,7 +160,13 @@ async def chat_endpoint(request: ChatRequest):
             _debug("forcing FINISH due to final AI response in history")
 
         if next_step == "FINISH":
-            reply = pick_last_reply(history)
+            if history and history[-1].role == "ai":
+                reply = pick_last_reply(history)
+            else:
+                reply = _generate_direct_reply(history)
+                history.append(WireMessage(role="ai", content=reply))
+                _debug("generated fresh FINISH reply for latest human turn")
+
             sessions[request.sender] = history
             _debug(f"-> bot reply='{_short(reply)}'")
             return {"reply": reply}
