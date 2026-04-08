@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy the AZTM package
+COPY aztm /app/aztm
+COPY pyproject.toml /app/
+
+# Install dependencies  
+RUN pip install --no-cache-dir -e . && \
+    pip install --no-cache-dir fastapi uvicorn
+
+# Copy the interactive client script
+COPY docker/interactive_client.py /app/
+
+# Environment variables for AZTM credentials
+ENV AZTM_USER=aztmclient@sure.im
+ENV AZTM_PASSWORD=12345678
+ENV AZTM_SERVER=aztmapi@sure.im
+
+# Run the interactive client
+CMD ["python", "-u", "interactive_client.py"]

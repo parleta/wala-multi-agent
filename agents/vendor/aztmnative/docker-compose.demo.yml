@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  aztm-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+    container_name: aztm-demo-server
+    environment:
+      - JID=aztmapi@sure.im
+      - PASSWORD=12345678
+      - AZTM_LOG_LEVEL=INFO
+    restart: unless-stopped
+    # No ports exposed - all communication via messaging!
+
+  aztm-client:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.client
+    container_name: aztm-demo-client
+    environment:
+      - JID=aztmclient@sure.im
+      - PASSWORD=12345678
+      - SERVER_JID=aztmapi@sure.im
+      - AZTM_LOG_LEVEL=INFO
+    depends_on:
+      - aztm-server
+    restart: "no"
+    # No network needed - communicates via external messaging service!

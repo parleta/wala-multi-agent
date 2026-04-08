@@ -1,0 +1,31 @@
+services:
+  xmpp:
+    image: ghcr.io/processone/ejabberd:latest
+    container_name: wala-xmpp
+    entrypoint: ["/bin/sh", "/bootstrap/entrypoint.sh"]
+    ports:
+      - "5222:5222"
+      - "5280:5280"
+    volumes:
+      - ./ejabberd.yml:/home/ejabberd/conf/ejabberd.yml:ro
+      - ./entrypoint.sh:/bootstrap/entrypoint.sh:ro
+      - ./bootstrap_users.sh:/bootstrap/bootstrap_users.sh:ro
+      - xmpp_data:/home/ejabberd/database
+    healthcheck:
+      test: ["CMD-SHELL", "ejabberdctl status >/dev/null 2>&1 && test -f /home/ejabberd/database/.users_bootstrapped"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      xmpp_net:
+        aliases:
+          - xmpp
+          - xmpp.local
+
+volumes:
+  xmpp_data:
+    name: wala_xmpp_data
+
+networks:
+  xmpp_net:
+    name: wala_xmpp_net

@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  openfire:
+    image: gizmotronic/openfire:latest
+    container_name: aztm-openfire
+    ports:
+      - "5222:5222"  # XMPP Client-to-Server
+      - "5269:5269"  # XMPP Server-to-Server (federation)
+      - "7443:7443"  # HTTP File Upload
+      - "9090:9090"  # Admin Console
+    environment:
+      - DOMAIN=xmpp.example
+      - ADMIN_PASSWORD=admin123
+    volumes:
+      - openfire_data:/var/lib/openfire
+      - ./config/openfire:/etc/openfire/conf
+    networks:
+      - aztm-net
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "5222"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  aztm-test:
+    build: .
+    container_name: aztm-test
+    depends_on:
+      openfire:
+        condition: service_healthy
+    environment:
+      - AZTM_HOST=openfire
+      - AZTM_PORT=5222
+      - AZTM_DOMAIN=aztm.example
+      - AZTM_LOG_LEVEL=DEBUG
+    volumes:
+      - .:/app
+      - aztm_cache:/app/.pytest_cache
+    networks:
+      - aztm-net
+    command: pytest -v tests/
+
+  # Optional: Development server for testing
+  aztm-dev:
+    build: .
+    container_name: aztm-dev
+    depends_on:
+      openfire:
+        condition: service_healthy
+    environment:
+      - AZTM_HOST=openfire
+      - AZTM_PORT=5222
+      - AZTM_DOMAIN=aztm.example
+      - AZTM_LOG_LEVEL=DEBUG
+    volumes:
+      - .:/app
+    networks:
+      - aztm-net
+    ports:
+      - "8000:8000"  # FastAPI test server
+    command: python -m aztm.tools.dev_server
+    profiles:
+      - dev
+
+volumes:
+  openfire_data:
+  aztm_cache:
+
+networks:
+  aztm-net:
+    driver: bridge

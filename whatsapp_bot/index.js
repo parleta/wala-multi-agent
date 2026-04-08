@@ -4,6 +4,13 @@ const pino = require('pino');
 const axios = require('axios');
 
 const targetChatId = '120363424923387540@g.us'
+const botBridgeUrl = process.env.BOT_BRIDGE_URL || 'http://bot_bridge:8000/chat';
+
+function shortText(text, maxLen = 180) {
+    if (!text) return "";
+    if (text.length <= maxLen) return text;
+    return text.slice(0, maxLen - 3) + "...";
+}
 
 async function startBot() {
     const { version } = await fetchLatestBaileysVersion();
@@ -48,12 +55,15 @@ async function startBot() {
             console.log(`[AGENT] Processing: ${text}`);
             
             try {
-                const response = await axios.post('http://orchestrator:8000/chat', {
+                console.log(`[BOT] -> bridge: ${shortText(text)}`);
+                const response = await axios.post(botBridgeUrl, {
                     text: text,
                     sender: sender
                 });
 
+                console.log(`[BOT] <- bridge reply: ${shortText(response?.data?.reply || "")}`);
                 await sock.sendMessage(sender, { text: response.data.reply });
+                console.log(`[BOT] -> WhatsApp message sent`);
             } catch (error) {
                 console.error("❌ Agent Error:", error.message);
             }

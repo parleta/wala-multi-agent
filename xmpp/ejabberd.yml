@@ -1,0 +1,73 @@
+hosts:
+  - xmpp.local
+
+loglevel: info
+
+certfiles:
+  - /home/ejabberd/conf/server.pem
+
+listen:
+  -
+    port: 5222
+    module: ejabberd_c2s
+    starttls: true
+    starttls_required: false
+    access: c2s
+    shaper: c2s_shaper
+    max_stanza_size: 262144
+  -
+    port: 5280
+    module: ejabberd_http
+    request_handlers:
+      /admin: ejabberd_web_admin
+
+acl:
+  admin:
+    user:
+      - admin@xmpp.local
+  local:
+    user_regexp: ""
+
+access_rules:
+  local:
+    allow: local
+  c2s:
+    allow: all
+  trusted_network:
+    allow: all
+
+api_permissions:
+  "console commands":
+    from:
+      - ejabberd_ctl
+    who: all
+    what: "*"
+
+shaper:
+  normal:
+    rate: 3000
+    burst_size: 20000
+
+shaper_rules:
+  max_user_sessions: 10
+  c2s_shaper:
+    normal: all
+
+modules:
+  mod_adhoc: {}
+  mod_admin_extra: {}
+  mod_blocking: {}
+  mod_caps: {}
+  mod_client_state: {}
+  mod_disco: {}
+  mod_last: {}
+  mod_ping: {}
+  mod_privacy: {}
+  mod_register:
+    ip_access: trusted_network
+  mod_roster:
+    versioning: true
+  mod_stream_mgmt:
+    resend_on_timeout: if_offline
+  mod_version:
+    show_os: false

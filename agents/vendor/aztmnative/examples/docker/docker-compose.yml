@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  # XMPP Server (using ejabberd as it's more Docker-friendly than Openfire)
+  xmpp:
+    image: ejabberd/ecs:latest
+    container_name: aztm-xmpp
+    ports:
+      - "5222:5222"  # XMPP Client-to-Server
+      - "5280:5280"  # HTTP Admin/Upload
+    environment:
+      - EJABBERD_HOST=sure.im
+      - EJABBERD_ADMINS=admin@sure.im
+      - EJABBERD_USERS=aztmclient@sure.im:12345678 aztmapi@sure.im:12345678
+      - EJABBERD_LOG_LEVEL=4
+    volumes:
+      - xmpp_data:/home/ejabberd/database
+      - ./ejabberd.yml:/home/ejabberd/conf/ejabberd.yml:ro
+    networks:
+      - aztm-network
+    healthcheck:
+      test: ["CMD", "ejabberdctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # AZTM Server Container (FastAPI service)
+  aztm-server:
+    build:
+      context: ../..
+      dockerfile: examples/docker/Dockerfile.server
+    container_name: aztm-server
+    environment:
+      - AZTM_XMPP_HOST=xmpp
+      - AZTM_XMPP_PORT=5222
+      - AZTM_XMPP_DOMAIN=sure.im
+      - AZTM_JID=aztmapi@sure.im
+      - AZTM_PASSWORD=12345678
+      - AZTM_LOG_LEVEL=DEBUG
+      - AZTM_FEATURE_JOSE=1
+      - AZTM_FEATURE_TLS=1
+    volumes:
+      - ./server:/app/server
+    depends_on:
+      xmpp:
+        condition: service_healthy
+    networks:
+      - aztm-network
+    restart: unless-stopped
+
+  # AZTM Client Container (HTTP client)
+  aztm-client:
+    build:
+      context: ../..
+      dockerfile: examples/docker/Dockerfile.client
+    container_name: aztm-client
+    environment:
+      - AZTM_XMPP_HOST=xmpp
+      - AZTM_XMPP_PORT=5222
+      - AZTM_XMPP_DOMAIN=sure.im
+      - AZTM_JID=aztmclient@sure.im
+      - AZTM_PASSWORD=12345678
+      - AZTM_LOG_LEVEL=DEBUG
+      - AZTM_SERVER_JID=aztmapi@sure.im
+      - AZTM_FEATURE_JOSE=1
+      - AZTM_FEATURE_TLS=1
+    volumes:
+      - ./client:/app/client
+    depends_on:
+      - xmpp
+      - aztm-server
+    networks:
+      - aztm-network
+    restart: unless-stopped
+    command: ["python", "/app/client/demo_client.py"]
+
+networks:
+  aztm-network:
+    driver: bridge
+
+volumes:
+  xmpp_data:

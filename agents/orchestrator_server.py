@@ -1,7 +1,8 @@
+import asyncio
 import os
 from typing import Literal
 
-import httpx
+import requests
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -9,11 +10,15 @@ from langchain_core.messages import SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
+from aztm_bootstrap import login_aztm_from_env
 from message_protocol import WireMessage, last_ai_text, wire_to_lc
 
 load_dotenv()
 
 app = FastAPI()
+
+# Initialize AZTM after FastAPI app is created so auto-hook can detect the app.
+login_aztm_from_env(server_mode=True)
 
 BASE_DIR = os.path.dirname(__file__)
 with open(os.path.join(BASE_DIR, "prompts", "supervisor.md"), "r", encoding="utf-8") as f:
@@ -37,14 +42,45 @@ class Router(BaseModel):
 sessions: dict[str, list[WireMessage]] = {}
 
 
-async def call_agent(url: str, messages: list[WireMessage]) -> list[WireMessage]:
-    payload = {"messages": [m.model_dump() for m in messages]}
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        response = await client.post(url, json=payload)
-        response.raise_for_status()
-        data = response.json()
+def _debug(msg: str) -> None:
+    print(f"[ORCH] {msg}", flush=True)
 
-    return [WireMessage(**item) for item in data["messages"]]
+
+def _short(text: str, max_len: int = 180) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _last_role_text(messages: list[WireMessage], role: str) -> str:
+    for msg in reversed(messages):
+        if msg.role == role:
+            return msg.content
+    return ""
+
+
+def _post_json(url: str, payload: dict, timeout: float) -> dict:
+    response = requests.post(url, json=payload, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+async def call_agent(url: str, agent_name: str, messages: list[WireMessage]) -> list[WireMessage]:
+    payload = {"messages": [m.model_dump() for m in messages]}
+    _debug(
+        f"-> {agent_name} url={url} "
+        f"last_human='{_short(_last_role_text(messages, 'human'))}' "
+        f"history_len={len(messages)}"
+    )
+    data = await asyncio.to_thread(_post_json, url, payload, 120.0)
+
+    new_messages = [WireMessage(**item) for item in data["messages"]]
+    _debug(
+        f"<- {agent_name} "
+        f"last_ai='{_short(_last_role_text(new_messages, 'ai'))}' "
+        f"history_len={len(new_messages)}"
+    )
+    return new_messages
 
 
 def should_force_finish_from_last_message(messages: list[WireMessage]) -> bool:
@@ -66,6 +102,7 @@ def pick_last_reply(messages: list[WireMessage]) -> str:
 
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
+    _debug(f"<- bot sender={request.sender} text='{_short(request.text)}'")
     history = sessions.get(request.sender, []).copy()
     history.append(WireMessage(role="human", content=request.text))
 
@@ -76,24 +113,29 @@ async def chat_endpoint(request: ChatRequest):
         lc_messages = wire_to_lc(history)
         router_response = structured_llm.invoke([SystemMessage(content=SUPERVISOR_PROMPT)] + lc_messages)
         next_step = router_response.next_agent
+        _debug(f"router next_agent={next_step}")
 
         if should_force_finish_from_last_message(history):
             next_step = "FINISH"
+            _debug("forcing FINISH due to final AI response in history")
 
         if next_step == "FINISH":
             reply = pick_last_reply(history)
             sessions[request.sender] = history
+            _debug(f"-> bot reply='{_short(reply)}'")
             return {"reply": reply}
 
         target_url = CALENDAR_AGENT_URL if next_step == "calendar_agent" else MAPS_AGENT_URL
 
         try:
-            history = await call_agent(target_url, history)
-        except httpx.HTTPError as exc:
+            history = await call_agent(target_url, next_step, history)
+        except requests.RequestException as exc:
+            _debug(f"agent call failed next_agent={next_step} error={exc}")
             raise HTTPException(status_code=502, detail=f"Agent call failed: {exc}") from exc
 
     reply = pick_last_reply(history)
     sessions[request.sender] = history
+    _debug(f"-> bot reply(max-iterations)='{_short(reply)}'")
     return {"reply": reply}
 
 

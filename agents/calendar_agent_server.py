@@ -6,11 +6,15 @@ from fastapi import FastAPI
 from langchain_google_community import CalendarToolkit
 
 from agent_service_common import run_agent_until_response
-from message_protocol import AgentRunRequest, AgentRunResponse, last_ai_text, lc_to_wire, wire_to_lc
+from aztm_bootstrap import login_aztm_from_env
+from message_protocol import AgentRunRequest, AgentRunResponse, WireMessage, last_ai_text, lc_to_wire, wire_to_lc
 
 load_dotenv()
 
 app = FastAPI()
+
+# Initialize AZTM after FastAPI app is created so auto-hook can detect the app.
+login_aztm_from_env(server_mode=True)
 
 BASE_DIR = os.path.dirname(__file__)
 with open(os.path.join(BASE_DIR, "prompts", "calendar.md"), "r", encoding="utf-8") as f:
@@ -20,11 +24,31 @@ calendar_toolkit = CalendarToolkit()
 calendar_tools = calendar_toolkit.get_tools()
 
 
+def _short(text: str, max_len: int = 180) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _last_human_text(messages: list[WireMessage]) -> str:
+    for msg in reversed(messages):
+        if msg.role == "human":
+            return msg.content
+    return ""
+
+
 @app.post("/run", response_model=AgentRunResponse)
 async def run_calendar_agent(request: AgentRunRequest):
+    print(
+        f"[CAL] <- orchestrator messages={len(request.messages)} "
+        f"last_human='{_short(_last_human_text(request.messages))}'",
+        flush=True,
+    )
     messages = wire_to_lc(request.messages)
     updated_messages = run_agent_until_response(messages, CALENDAR_PROMPT, calendar_tools)
-    return AgentRunResponse(messages=lc_to_wire(updated_messages), reply=last_ai_text(updated_messages))
+    reply = last_ai_text(updated_messages)
+    print(f"[CAL] -> orchestrator reply='{_short(reply)}'", flush=True)
+    return AgentRunResponse(messages=lc_to_wire(updated_messages), reply=reply)
 
 
 if __name__ == "__main__":

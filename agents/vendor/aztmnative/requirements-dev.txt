@@ -1,0 +1,25 @@
+# Development dependencies
+-r requirements.txt
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+pytest-timeout>=2.1.0
+
+# Code quality
+black>=23.0.0
+mypy>=1.5.0
+flake8>=6.1.0
+pre-commit>=3.4.0
+
+# Multi-version testing
+tox>=4.11.0
+
+# Packaging
+build>=0.10.0
+twine>=4.0.0
+
+# Optional: OMEMO support
+# python-omemo>=0.1.0
+# python-axolotl>=0.2.0

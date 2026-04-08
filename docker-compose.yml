@@ -1,34 +1,136 @@
 services:
+  xmpp_ready:
+    image: busybox:1.36
+    container_name: wala-xmpp-ready
+    command:
+      [
+        "sh",
+        "-c",
+        "until nc -z xmpp 5222 && [ -f /xmpp_data/.users_bootstrapped ]; do echo waiting for xmpp bootstrap; sleep 2; done",
+      ]
+    networks:
+      - xmpp_net
+    volumes:
+      - xmpp_data:/xmpp_data:ro
+    restart: "no"
+
   orchestrator:
     build: ./agents
     container_name: wala-orchestrator
     env_file: ./agents/.env
+    environment:
+      AZTM_HOST: xmpp
+      AZTM_PORT: "5222"
+      AZTM_DOMAIN: xmpp.local
+      AZTM_XMPP_USE_TLS: "1"
+      AZTM_XMPP_VERIFY_CERT: "0"
+      AZTM_JID: orchestrator@xmpp.local
+      AZTM_PASSWORD: orchestrator123
+      SERVICE_MAP: '{"calendar_agent:8000":"calendar_agent@xmpp.local","maps_agent:8000":"maps_agent@xmpp.local"}'
     command: ["python", "orchestrator_server.py"]
     depends_on:
-      - calendar_agent
-      - maps_agent
+      xmpp_ready:
+        condition: service_completed_successfully
+      calendar_agent:
+        condition: service_started
+      maps_agent:
+        condition: service_started
     ports:
       - "8000:8000"
+    networks:
+      - default
+      - xmpp_net
 
   calendar_agent:
     build: ./agents
     container_name: wala-calendar-agent
     env_file: ./agents/.env
+    environment:
+      AZTM_DISABLE_AUTO_PATCH: "1"
+      AZTM_HOST: xmpp
+      AZTM_PORT: "5222"
+      AZTM_DOMAIN: xmpp.local
+      AZTM_XMPP_USE_TLS: "1"
+      AZTM_XMPP_VERIFY_CERT: "0"
+      AZTM_JID: calendar_agent@xmpp.local
+      AZTM_PASSWORD: calendar123
     command: ["python", "calendar_agent_server.py"]
+    depends_on:
+      xmpp_ready:
+        condition: service_completed_successfully
     volumes:
       - ./agents/credentials.json:/app/credentials.json
       - ./agents/token.json:/app/token.json
+    networks:
+      - default
+      - xmpp_net
 
   maps_agent:
     build: ./agents
     container_name: wala-maps-agent
     env_file: ./agents/.env
+    environment:
+      AZTM_DISABLE_AUTO_PATCH: "1"
+      AZTM_HOST: xmpp
+      AZTM_PORT: "5222"
+      AZTM_DOMAIN: xmpp.local
+      AZTM_XMPP_USE_TLS: "1"
+      AZTM_XMPP_VERIFY_CERT: "0"
+      AZTM_JID: maps_agent@xmpp.local
+      AZTM_PASSWORD: maps123
     command: ["python", "maps_agent_server.py"]
+    depends_on:
+      xmpp_ready:
+        condition: service_completed_successfully
+    networks:
+      - default
+      - xmpp_net
+
+  bot_bridge:
+    build: ./agents
+    container_name: wala-bot-bridge
+    env_file: ./agents/.env
+    environment:
+      AZTM_HOST: xmpp
+      AZTM_PORT: "5222"
+      AZTM_DOMAIN: xmpp.local
+      AZTM_XMPP_USE_TLS: "1"
+      AZTM_XMPP_VERIFY_CERT: "0"
+      AZTM_JID: bot_bridge@xmpp.local
+      AZTM_PASSWORD: botbridge123
+      SERVICE_MAP: '{"orchestrator:8000":"orchestrator@xmpp.local"}'
+      ORCHESTRATOR_URL: http://orchestrator:8000/chat
+    command: ["python", "bot_bridge_server.py"]
+    depends_on:
+      xmpp_ready:
+        condition: service_completed_successfully
+      orchestrator:
+        condition: service_started
+    networks:
+      - default
+      - xmpp_net
 
   whatsapp_bot:
     build: ./whatsapp_bot
     container_name: wala-bot
     depends_on:
-      - orchestrator
+      xmpp_ready:
+        condition: service_completed_successfully
+      bot_bridge:
+        condition: service_started
+    environment:
+      BOT_BRIDGE_URL: http://bot_bridge:8000/chat
     volumes:
       - ./whatsapp_bot/auth_info:/app/auth_info
+    networks:
+      - default
+      - xmpp_net
+
+networks:
+  xmpp_net:
+    external: true
+    name: wala_xmpp_net
+
+volumes:
+  xmpp_data:
+    name: wala_xmpp_data

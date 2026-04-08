@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the entire aztm package
+COPY aztm /app/aztm
+COPY pyproject.toml /app/
+COPY README.md /app/
+
+# Install AZTM and dependencies
+RUN pip install --no-cache-dir -e .
+
+# Copy client example
+COPY examples/docker/client /app/client
+
+# Run the client demo
+CMD ["python", "/app/client/demo_client.py"]
